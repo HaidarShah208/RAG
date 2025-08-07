@@ -24,7 +24,7 @@ export class RAGIntegrationService {
         headers: {
           ...formData.getHeaders(),
         },
-        timeout: 30000  
+        timeout: 120000  // Increased to 2 minutes for CCH processing
       });
 
       if (response.data.status === 'success') {

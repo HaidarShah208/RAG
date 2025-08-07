@@ -162,6 +162,121 @@ def chunk_text(text, chunk_size=1000, overlap=200):
     
     return [chunk for chunk in chunks if chunk.strip()]
 
+def semantic_chunk_text(text, chunk_size=1000, overlap=200):
+    """Semantic chunking based on sentence similarity"""
+    if len(text) <= chunk_size:
+        return [text]
+    
+    # Split into sentences
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    sentences = [s.strip() for s in sentences if s.strip()]
+    
+    if len(sentences) <= 1:
+        return chunk_text(text, chunk_size, overlap)  
+    
+    try:
+        sentence_embeddings = embedder.encode(sentences, convert_to_numpy=True)
+        
+         
+        similarities = []
+        for i in range(len(sentence_embeddings) - 1):
+            vec1 = sentence_embeddings[i]
+            vec2 = sentence_embeddings[i + 1]
+            similarity = np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2))
+            similarities.append(similarity)
+        
+         
+        if similarities:
+            threshold = np.percentile(similarities, 75)  
+            breakpoints = [i for i, sim in enumerate(similarities) if sim < threshold]
+        else:
+            breakpoints = []
+        
+         
+        chunks = []
+        start = 0
+        
+        for bp in breakpoints:
+            chunk_text = ". ".join(sentences[start:bp + 1])
+            if len(chunk_text) > 50:  
+                chunks.append(chunk_text)
+            start = bp + 1
+        
+         
+        if start < len(sentences):
+            chunk_text = ". ".join(sentences[start:])
+            if len(chunk_text) > 50:
+                chunks.append(chunk_text)
+        
+        # If semantic chunking didn't work well, fallback to regular chunking
+        if len(chunks) < 2:
+            return chunk_text(text, chunk_size, overlap)
+        
+        return chunks
+        
+    except Exception as e:
+        print(f"Semantic chunking failed, using regular chunking: {e}")
+        return chunk_text(text, chunk_size, overlap)
+
+def context_enriched_retrieve(query_embedding, top_k=3, context_size=1):
+    """Retrieve chunks with neighboring context"""
+    try:
+        results = index.query(
+            vector=query_embedding.tolist(),
+            top_k=top_k,
+            include_metadata=True
+        )
+        
+        if not results.matches:
+            return []
+        
+        # Get all unique chunk indices
+        chunk_indices = set()
+        for match in results.matches:
+            chunk_index = match.metadata.get("chunk_index", 0)
+            # Add neighboring chunks
+            for i in range(max(0, int(chunk_index - context_size)), 
+                          int(chunk_index + context_size + 1)):
+                chunk_indices.add(i)
+        
+        # Retrieve all chunks with context
+        enriched_chunks = []
+        for match in results.matches:
+            chunk_index = match.metadata.get("chunk_index", 0)
+            
+            # Get neighboring chunks
+            start_idx = max(0, int(chunk_index - context_size))
+            end_idx = int(chunk_index + context_size + 1)
+            
+            # Find all chunks in this range
+            for other_match in results.matches:
+                other_index = other_match.metadata.get("chunk_index", 0)
+                if start_idx <= int(other_index) < end_idx:
+                    enriched_chunks.append(other_match.metadata["chunk"])
+            
+             
+            break
+        
+         
+        seen = set()
+        unique_chunks = []
+        for chunk in enriched_chunks:
+            if chunk not in seen:
+                seen.add(chunk)
+                unique_chunks.append(chunk)
+        
+        return unique_chunks[:top_k + context_size * 2]  
+        
+    except Exception as e:
+        print(f"Context-enriched retrieval failed: {e}")
+         
+        results = index.query(
+            vector=query_embedding.tolist(),
+            top_k=top_k,
+            include_metadata=True
+        )
+        return [match.metadata["chunk"] for match in results.matches]
+
 def generate_local_response(context, query):
     """Generate response using local LLM"""
     if not context.strip():
@@ -184,14 +299,17 @@ Answer:"""
 
 class QueryRequest(BaseModel):
     query: str
+    use_context_enriched: bool = True  
 
 class IngestRequest(BaseModel):
     data_source_id: str = None
+    use_semantic_chunking: bool = True  
 
 @app.post("/ingest")
 async def ingest(
     data_source_id: str = Form(None),
-    file: UploadFile = File(...)
+    file: UploadFile = File(...),
+    use_semantic_chunking: bool = Form(True)
 ):
     """Ingest PDF file and create embeddings"""
     try:
@@ -206,8 +324,13 @@ async def ingest(
             )
         
          
-        chunks = chunk_text(text)
-        print(f"Created {len(chunks)} chunks from {file.filename}")
+         
+        if use_semantic_chunking:
+            chunks = semantic_chunk_text(text)
+            print(f"Created {len(chunks)} semantic chunks from {file.filename}")
+        else:
+            chunks = chunk_text(text)
+            print(f"Created {len(chunks)} regular chunks from {file.filename}")
         
          
         embeddings = embedder.encode(chunks, convert_to_numpy=True)
@@ -261,27 +384,34 @@ async def query(req: QueryRequest):
         print(f"[QUERY] Processing query: {req.query}")
         
          
-        results = index.query(
-            vector=query_embedding.tolist(),
-            top_k=3,  # Reduced from 5 to 3
-            include_metadata=True
-        )
+         
+        if req.use_context_enriched:
+            retrieved_chunks = context_enriched_retrieve(query_embedding, top_k=3, context_size=1)
+            print(f"[QUERY] Using context-enriched retrieval")
+        else:
+             
+            results = index.query(
+                vector=query_embedding.tolist(),
+                top_k=3,
+                include_metadata=True
+            )
+            retrieved_chunks = [match.metadata["chunk"] for match in results.matches]
+            print(f"[QUERY] Using regular retrieval")
         
-        if not results.matches:
+        if not retrieved_chunks:
             return JSONResponse(
                 status_code=404,
                 content={"error": "No relevant documents found"}
             )
         
          
-        retrieved_chunks = [match.metadata["chunk"] for match in results.matches]
-        # Limit context to prevent token overflow
         context = "\n\n".join(retrieved_chunks)
-        if len(context) > 2000:  # Limit to ~2000 characters
+        if len(context) > 2000:  
             context = context[:2000] + "..."
         
         print(f"[QUERY] Retrieved {len(retrieved_chunks)} chunks")
         print(f"[QUERY] Context length: {len(context)} characters")
+        print(f"[QUERY] Retrieval method: {'Context-Enriched' if req.use_context_enriched else 'Regular'}")
         
 
         answer = generate_local_response(context, req.query)
@@ -308,13 +438,8 @@ async def debug_retrieve(req: QueryRequest):
     try:
         query_embedding = embedder.encode([req.query], convert_to_numpy=True)[0]
         
-        results = index.query(
-            vector=query_embedding.tolist(),
-            top_k=3,  # Reduced from 5 to 3
-            include_metadata=True
-        )
-        
-        retrieved_chunks = [match.metadata["chunk"] for match in results.matches]
+         
+        retrieved_chunks = context_enriched_retrieve(query_embedding, top_k=3, context_size=1)
         
         return {
             "query": req.query,
@@ -326,6 +451,47 @@ async def debug_retrieve(req: QueryRequest):
         return JSONResponse(
             status_code=500,
             content={"error": f"Debug retrieve failed: {str(e)}"}
+        )
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {
+        "status": "healthy",
+        "service": "rag-service-enhanced",
+        "features": {
+            "semantic_chunking": True,
+            "context_enriched_retrieval": True,
+            "local_llm": True,
+            "pinecone_integration": True
+        },
+        "llm_type": "local-llama"
+    }
+
+@app.post("/test-chunking")
+async def test_chunking(text: str = Body(...)):
+    """Test different chunking methods on sample text"""
+    try:
+         
+        regular_chunks = chunk_text(text)
+        
+         
+        semantic_chunks = semantic_chunk_text(text)
+        
+        return {
+            "regular_chunks": {
+                "count": len(regular_chunks),
+                    "chunks": regular_chunks[:3]  
+            },
+            "semantic_chunks": {
+                "count": len(semantic_chunks),
+                "chunks": semantic_chunks[:3]  
+            }
+        }
+    except Exception as e:
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"Chunking test failed: {str(e)}"}
         )
 
 if __name__ == "__main__":
